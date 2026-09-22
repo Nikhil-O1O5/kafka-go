@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Nikhil-O1O5/kafka-go/internal/shared"
@@ -14,38 +15,66 @@ import (
 type KafkaConsumer struct {
 	consumer *kafka.Consumer
 	topic    string
-	msgCH    chan<- string
+	msgCH    chan<- *shared.Message
 	readyCH  chan struct{}
+	exitCH   chan struct{}
 	isReady  bool
+
+	msgsStateMap map[kafka.Offset]bool
+	mu           *sync.RWMutex
+	lastCommited kafka.Offset
+	maxReceived  *kafka.TopicPartition
+	commitDur    time.Duration
 }
 
-func NewKafkaConsumer(msgCH chan<- string) (*KafkaConsumer, error) {
+func NewKafkaConsumer(msgCH chan<- *shared.Message) (*KafkaConsumer, error) {
 	cfg := shared.NewKafkaConfig()
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": cfg.Host,
-		"group.id":          cfg.ConsumerGroup,
-		"auto.offset.reset": "earliest",
+		"bootstrap.servers":  cfg.Host,
+		"group.id":           cfg.ConsumerGroup,
+		"enable.auto.commit": false,
 	})
-
 	if err != nil {
 		return nil, err
 	}
+
+	tp := kafka.TopicPartition{Topic: &cfg.Topic, Partition: 0}
+
+	committed, err := c.Committed([]kafka.TopicPartition{tp}, 5000)
+	if err != nil {
+		return nil, err
+	}
+
+	startOffset := kafka.OffsetBeginning
+	if len(committed) > 0 && committed[0].Offset != kafka.OffsetInvalid {
+		startOffset = committed[0].Offset
+	}
+	logrus.WithField("start_offset", startOffset).Info("consumer starting position")
 
 	consumer := &KafkaConsumer{
-		consumer: c,
-		topic:    cfg.Topic,
-		msgCH:    msgCH,
-		readyCH:  make(chan struct{}),
-		isReady:  false,
+		consumer:     c,
+		topic:        cfg.Topic,
+		msgCH:        msgCH,
+		readyCH:      make(chan struct{}),
+		exitCH:       make(chan struct{}),
+		isReady:      false,
+		mu:           new(sync.RWMutex),
+		msgsStateMap: map[kafka.Offset]bool{},
+		lastCommited: startOffset,
+		maxReceived:  &kafka.TopicPartition{Topic: &cfg.Topic, Partition: 0, Offset: startOffset},
+		commitDur:    15 * time.Second,
 	}
+
 	consumer.initializeKafkaTopic(cfg.Host, cfg.Topic)
 
-	err = c.SubscribeTopics([]string{cfg.Topic}, nil)
-
+	err = c.Assign([]kafka.TopicPartition{
+		{Topic: &consumer.topic, Partition: 0, Offset: startOffset},
+	})
 	if err != nil {
 		return nil, err
 	}
 
+	go consumer.commitOffsetLoop()
 	go consumer.checkReadyToAccept()
 	go consumer.readMsgLoop()
 
@@ -59,16 +88,82 @@ func (c *KafkaConsumer) readMsgLoop() {
 		if err != nil && err.(kafka.Error).IsTimeout() {
 			continue
 		}
-		if err != nil && !err.(kafka.Error).IsTimeout() {
-			// The client will automatically try to recover from all errors.
-			// Timeout is not considered an error because it is raised by
-			// ReadMessage in absence of messages.
-			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
+		if err != nil {
+			fmt.Printf("consumer error: %v (%v)\n", err, msg)
 			continue
 		}
 
-		payload := msg.Value
-		c.msgCH <- string(payload)
+		c.appendMsgState(&msg.TopicPartition)
+		c.msgCH <- shared.NewMessage(&msg.TopicPartition, msg.Value)
+	}
+}
+
+func (c *KafkaConsumer) appendMsgState(tp *kafka.TopicPartition) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgsStateMap[tp.Offset] = false
+	if c.maxReceived.Offset < tp.Offset {
+		c.maxReceived = &kafka.TopicPartition{
+			Topic:     tp.Topic,
+			Partition: tp.Partition,
+			Offset:    tp.Offset,
+		}
+	}
+}
+
+func (c *KafkaConsumer) MarkAsComplete(tp *kafka.TopicPartition) {
+	logrus.WithField("offset", tp.Offset).Info("MarkAsComplete")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgsStateMap[tp.Offset] = true
+}
+
+func (c *KafkaConsumer) commitOffsetLoop() {
+	ticker := time.NewTicker(c.commitDur)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.mu.Lock()
+			if c.lastCommited == c.maxReceived.Offset {
+				c.mu.Unlock()
+				continue
+			}
+
+			safeCommit := *c.maxReceived
+			for offset := c.lastCommited; offset < c.maxReceived.Offset; offset++ {
+				completed, exists := c.msgsStateMap[offset]
+				if !exists {
+					continue
+				}
+				if completed {
+					delete(c.msgsStateMap, offset)
+					continue
+				}
+				// found an incomplete offset — stop here
+				safeCommit.Offset = offset
+				break
+			}
+			c.mu.Unlock()
+
+			if safeCommit.Offset == c.lastCommited {
+				continue
+			}
+
+			_, err := c.consumer.CommitOffsets([]kafka.TopicPartition{safeCommit})
+			if err != nil {
+				logrus.WithError(err).Errorf("failed to commit offset %d", safeCommit.Offset)
+				continue
+			}
+
+			c.mu.Lock()
+			c.lastCommited = safeCommit.Offset
+			c.mu.Unlock()
+			logrus.WithField("offset", safeCommit.Offset).Warn("committed offset")
+
+		case <-c.exitCH:
+			return
+		}
 	}
 }
 
