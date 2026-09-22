@@ -1,10 +1,9 @@
 package producer
 
 import (
-	"fmt"
-
 	"github.com/Nikhil-O1O5/kafka-go/internal/shared"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/sirupsen/logrus"
 )
 
 type KafkaProducer struct {
@@ -12,41 +11,37 @@ type KafkaProducer struct {
 	topic    string
 }
 
-func NewKafkaProducer(topic string) *KafkaProducer {
+func NewKafkaProducer(topic string) (*KafkaProducer, error) {
 	cfg := shared.NewKafkaConfig()
 	if topic == "" {
 		topic = cfg.Topic
 	}
 	p, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": cfg.Host})
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 
 	go func() {
 		for e := range p.Events() {
-			switch ev := e.(type) {
-			case *kafka.Message:
-				if ev.TopicPartition.Error != nil {
-					fmt.Printf("Delivery Failed: %v\n", ev.TopicPartition)
+			if msg, ok := e.(*kafka.Message); ok {
+				if msg.TopicPartition.Error != nil {
+					logrus.WithError(msg.TopicPartition.Error).Error("delivery failed")
 				} else {
-					fmt.Printf("Delivery Successful %v\n", ev.TopicPartition)
+					logrus.WithField("offset", msg.TopicPartition.Offset).Info("delivery successful")
 				}
 			}
 		}
 	}()
 
-	return &KafkaProducer{
-		producer: p,
-		topic:    topic,
-	}
+	return &KafkaProducer{producer: p, topic: topic}, nil
 }
 
-func (p *KafkaProducer) Produce(msg string) {
+func (p *KafkaProducer) Produce(msg []byte) {
 	err := p.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
-		Value:          []byte(msg),
+		Value:          msg,
 	}, nil)
 	if err != nil {
-		fmt.Printf("error producing msg := %v \n", err)
+		logrus.WithError(err).Error("produce failed")
 	}
 }
