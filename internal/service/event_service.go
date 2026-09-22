@@ -2,10 +2,10 @@ package service
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/Nikhil-O1O5/kafka-go/internal/repo"
 	"github.com/jmoiron/sqlx"
+	"github.com/sirupsen/logrus"
 )
 
 type EventService struct {
@@ -19,14 +19,14 @@ func NewEventService(eventRepo *repo.EventRepo) *EventService {
 func (s *EventService) Process(ctx context.Context, event *repo.Event) error {
 	_, err := repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
 		if existing := s.eventRepo.Get(ctx, tx, event.EventId); existing != nil {
-			fmt.Printf("duplicate event_id=%s — skipping\n", event.EventId)
+			logrus.WithField("event_id", event.EventId).Info("duplicate event — skipping")
 			return "", nil
 		}
 		id, err := s.eventRepo.Insert(ctx, tx, event)
 		if err != nil {
 			return "", err
 		}
-		fmt.Printf("inserted event_id=%s\n", id)
+		logrus.WithField("event_id", id).Info("event inserted")
 		return id, nil
 	})
 	return err

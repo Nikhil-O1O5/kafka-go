@@ -3,7 +3,6 @@ package consumer
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -65,12 +64,13 @@ func NewKafkaConsumer(msgCH chan<- *shared.Message) (*KafkaConsumer, error) {
 		commitDur:    15 * time.Second,
 	}
 
-	consumer.initializeKafkaTopic(cfg.Host, cfg.Topic)
+	if err = consumer.initializeKafkaTopic(cfg.Host, cfg.Topic); err != nil {
+		return nil, err
+	}
 
-	err = c.Assign([]kafka.TopicPartition{
+	if err = c.Assign([]kafka.TopicPartition{
 		{Topic: &consumer.topic, Partition: 0, Offset: startOffset},
-	})
-	if err != nil {
+	}); err != nil {
 		return nil, err
 	}
 
@@ -81,15 +81,25 @@ func NewKafkaConsumer(msgCH chan<- *shared.Message) (*KafkaConsumer, error) {
 	return consumer, nil
 }
 
+func (c *KafkaConsumer) Close() {
+	close(c.exitCH)
+}
+
 func (c *KafkaConsumer) readMsgLoop() {
 	defer c.consumer.Close()
 	for {
+		select {
+		case <-c.exitCH:
+			return
+		default:
+		}
+
 		msg, err := c.consumer.ReadMessage(time.Second)
 		if err != nil && err.(kafka.Error).IsTimeout() {
 			continue
 		}
 		if err != nil {
-			fmt.Printf("consumer error: %v (%v)\n", err, msg)
+			logrus.WithError(err).Error("consumer read error")
 			continue
 		}
 
@@ -140,7 +150,6 @@ func (c *KafkaConsumer) commitOffsetLoop() {
 					delete(c.msgsStateMap, offset)
 					continue
 				}
-				// found an incomplete offset — stop here
 				safeCommit.Offset = offset
 				break
 			}
@@ -176,7 +185,7 @@ func (c *KafkaConsumer) initializeKafkaTopic(brokers, topicName string) error {
 	}
 	defer adminClient.Close()
 
-	log.Printf("Creating topic '%s'...", topicName)
+	logrus.WithField("topic", topicName).Info("creating topic")
 	topicSpec := kafka.TopicSpecification{
 		Topic:             topicName,
 		NumPartitions:     1,
@@ -193,13 +202,13 @@ func (c *KafkaConsumer) initializeKafkaTopic(brokers, topicName string) error {
 
 	for _, result := range results {
 		if result.Error.Code() == kafka.ErrTopicAlreadyExists {
-			logrus.Infof("Topic already exists: %v", result.Error)
+			logrus.WithField("topic", result.Topic).Info("topic already exists")
 			continue
 		}
 		if result.Error.Code() != kafka.ErrNoError {
 			return fmt.Errorf("failed to create topic: %v", result.Error)
 		}
-		log.Printf("Topic '%s' created successfully", result.Topic)
+		logrus.WithField("topic", result.Topic).Info("topic created")
 	}
 
 	return c.waitForTopicReady(brokers, topicName)
@@ -215,11 +224,10 @@ func (c *KafkaConsumer) waitForTopicReady(brokers, topicName string) error {
 	defer adminClient.Close()
 
 	for {
-		time.Sleep(1 * time.Second)
+		time.Sleep(time.Second)
 		metadata, err := adminClient.GetMetadata(&topicName, false, 5000)
-
 		if err != nil {
-			logrus.Errorf("Metadata fetch failed %v\n", err)
+			logrus.WithError(err).Error("metadata fetch failed")
 			continue
 		}
 
@@ -228,59 +236,46 @@ func (c *KafkaConsumer) waitForTopicReady(brokers, topicName string) error {
 			continue
 		}
 
-		if len(topicMeta.Partitions) > 0 {
-			allPartitionsReady := true
-			for _, partition := range topicMeta.Partitions {
-				if partition.Error.Code() != kafka.ErrNoError {
-					allPartitionsReady = false
-					break
-				}
-				if partition.Leader == -1 {
-					allPartitionsReady = false
-					break
-				}
+		allReady := true
+		for _, partition := range topicMeta.Partitions {
+			if partition.Error.Code() != kafka.ErrNoError || partition.Leader == -1 {
+				allReady = false
+				break
 			}
+		}
 
-			logrus.WithField("IS_INITIALIZED", allPartitionsReady).Info("Cosumer Topic")
-
-			if allPartitionsReady {
-				return nil
-			}
+		logrus.WithField("ready", allReady).Info("topic readiness check")
+		if allReady {
+			return nil
 		}
 	}
 }
 
 func (c *KafkaConsumer) checkReadyToAccept() error {
-	defer func() {
-		c.isReady = true
-	}()
+	defer func() { c.isReady = true }()
 	for {
 		select {
 		case <-c.readyCH:
 			return nil
 		default:
-			time.Sleep(1 * time.Second)
+			time.Sleep(time.Second)
 			isReady, err := c.readyCheck()
 			if err != nil {
-				logrus.Error("Error on consumer readycheck")
+				logrus.WithError(err).Error("consumer ready check failed")
 				return err
 			}
-			logrus.WithField("STATUS", isReady).Warn("Consumer ready to accept")
-
+			logrus.WithField("ready", isReady).Info("consumer assignment check")
 			if isReady {
 				return nil
 			}
 		}
-
 	}
 }
 
 func (c *KafkaConsumer) readyCheck() (bool, error) {
 	assignment, err := c.consumer.Assignment()
 	if err != nil {
-		logrus.Errorf("Failed to get assignment: %v", err)
 		return false, err
 	}
-
 	return len(assignment) > 0, nil
 }
