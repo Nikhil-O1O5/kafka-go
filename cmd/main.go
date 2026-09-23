@@ -55,7 +55,7 @@ func (s *Server) produceMsg() {
 				logrus.WithError(err).Error("marshal failed")
 				continue
 			}
-			s.producer.Produce(b)
+			s.producer.Produce([]byte(event.EventId), b)
 		case <-s.stopCH:
 			return
 		}

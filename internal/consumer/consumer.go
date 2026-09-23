@@ -11,19 +11,23 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type KafkaConsumer struct {
-	consumer *kafka.Consumer
-	topic    string
-	msgCH    chan<- *shared.Message
-	readyCH  chan struct{}
-	exitCH   chan struct{}
-	isReady  bool
-
+type partitionState struct {
 	msgsStateMap map[kafka.Offset]bool
-	mu           *sync.RWMutex
 	lastCommited kafka.Offset
-	maxReceived  *kafka.TopicPartition
-	commitDur    time.Duration
+	maxReceived  kafka.Offset
+}
+
+type KafkaConsumer struct {
+	consumer  *kafka.Consumer
+	topic     string
+	msgCH     chan<- *shared.Message
+	readyCH   chan struct{}
+	exitCH    chan struct{}
+	isReady   bool
+	commitDur time.Duration
+
+	mu         *sync.RWMutex
+	partitions map[int32]*partitionState
 }
 
 func NewKafkaConsumer(msgCH chan<- *shared.Message) (*KafkaConsumer, error) {
@@ -37,40 +41,28 @@ func NewKafkaConsumer(msgCH chan<- *shared.Message) (*KafkaConsumer, error) {
 		return nil, err
 	}
 
-	tp := kafka.TopicPartition{Topic: &cfg.Topic, Partition: 0}
-
-	committed, err := c.Committed([]kafka.TopicPartition{tp}, 5000)
-	if err != nil {
-		return nil, err
-	}
-
-	startOffset := kafka.OffsetBeginning
-	if len(committed) > 0 && committed[0].Offset != kafka.OffsetInvalid {
-		startOffset = committed[0].Offset
-	}
-	logrus.WithField("start_offset", startOffset).Info("consumer starting position")
-
 	consumer := &KafkaConsumer{
-		consumer:     c,
-		topic:        cfg.Topic,
-		msgCH:        msgCH,
-		readyCH:      make(chan struct{}),
-		exitCH:       make(chan struct{}),
-		isReady:      false,
-		mu:           new(sync.RWMutex),
-		msgsStateMap: map[kafka.Offset]bool{},
-		lastCommited: startOffset,
-		maxReceived:  &kafka.TopicPartition{Topic: &cfg.Topic, Partition: 0, Offset: startOffset},
-		commitDur:    15 * time.Second,
+		consumer:   c,
+		topic:      cfg.Topic,
+		msgCH:      msgCH,
+		readyCH:    make(chan struct{}),
+		exitCH:     make(chan struct{}),
+		isReady:    false,
+		commitDur:  15 * time.Second,
+		mu:         new(sync.RWMutex),
+		partitions: map[int32]*partitionState{},
 	}
 
 	if err = consumer.initializeKafkaTopic(cfg.Host, cfg.Topic); err != nil {
 		return nil, err
 	}
 
-	if err = c.Assign([]kafka.TopicPartition{
-		{Topic: &consumer.topic, Partition: 0, Offset: startOffset},
-	}); err != nil {
+	allPartitions, err := consumer.fetchAllPartitions(cfg.Host, cfg.Topic)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = consumer.assignPartitions(allPartitions); err != nil {
 		return nil, err
 	}
 
@@ -79,6 +71,69 @@ func NewKafkaConsumer(msgCH chan<- *shared.Message) (*KafkaConsumer, error) {
 	go consumer.readMsgLoop()
 
 	return consumer, nil
+}
+
+func (c *KafkaConsumer) fetchAllPartitions(brokers, topicName string) ([]int32, error) {
+	adminClient, err := kafka.NewAdminClient(&kafka.ConfigMap{"bootstrap.servers": brokers})
+	if err != nil {
+		return nil, err
+	}
+	defer adminClient.Close()
+
+	metadata, err := adminClient.GetMetadata(&topicName, false, 5000)
+	if err != nil {
+		return nil, err
+	}
+
+	topicMeta, exists := metadata.Topics[topicName]
+	if !exists {
+		return nil, fmt.Errorf("topic %s not found in metadata", topicName)
+	}
+
+	ids := make([]int32, 0, len(topicMeta.Partitions))
+	for _, p := range topicMeta.Partitions {
+		ids = append(ids, p.ID)
+	}
+	return ids, nil
+}
+
+func (c *KafkaConsumer) assignPartitions(partitionIDs []int32) error {
+	tps := make([]kafka.TopicPartition, 0, len(partitionIDs))
+	for _, id := range partitionIDs {
+		tps = append(tps, kafka.TopicPartition{Topic: &c.topic, Partition: id})
+	}
+
+	committed, err := c.consumer.Committed(tps, 5000)
+	if err != nil {
+		return err
+	}
+
+	assignTPs := make([]kafka.TopicPartition, 0, len(committed))
+	for _, tp := range committed {
+		startOffset := kafka.OffsetBeginning
+		if tp.Offset != kafka.OffsetInvalid {
+			startOffset = tp.Offset
+		}
+
+		logrus.WithFields(logrus.Fields{
+			"partition":    tp.Partition,
+			"start_offset": startOffset,
+		}).Info("consumer starting position")
+
+		c.partitions[tp.Partition] = &partitionState{
+			msgsStateMap: map[kafka.Offset]bool{},
+			lastCommited: startOffset,
+			maxReceived:  startOffset,
+		}
+
+		assignTPs = append(assignTPs, kafka.TopicPartition{
+			Topic:     tp.Topic,
+			Partition: tp.Partition,
+			Offset:    startOffset,
+		})
+	}
+
+	return c.consumer.Assign(assignTPs)
 }
 
 func (c *KafkaConsumer) Close() {
@@ -111,21 +166,31 @@ func (c *KafkaConsumer) readMsgLoop() {
 func (c *KafkaConsumer) appendMsgState(tp *kafka.TopicPartition) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.msgsStateMap[tp.Offset] = false
-	if c.maxReceived.Offset < tp.Offset {
-		c.maxReceived = &kafka.TopicPartition{
-			Topic:     tp.Topic,
-			Partition: tp.Partition,
-			Offset:    tp.Offset,
-		}
+
+	ps, ok := c.partitions[tp.Partition]
+	if !ok {
+		return
+	}
+	ps.msgsStateMap[tp.Offset] = false
+	if tp.Offset > ps.maxReceived {
+		ps.maxReceived = tp.Offset
 	}
 }
 
 func (c *KafkaConsumer) MarkAsComplete(tp *kafka.TopicPartition) {
-	logrus.WithField("offset", tp.Offset).Info("MarkAsComplete")
+	logrus.WithFields(logrus.Fields{
+		"partition": tp.Partition,
+		"offset":    tp.Offset,
+	}).Info("MarkAsComplete")
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.msgsStateMap[tp.Offset] = true
+
+	ps, ok := c.partitions[tp.Partition]
+	if !ok {
+		return
+	}
+	ps.msgsStateMap[tp.Offset] = true
 }
 
 func (c *KafkaConsumer) commitOffsetLoop() {
@@ -135,40 +200,57 @@ func (c *KafkaConsumer) commitOffsetLoop() {
 		select {
 		case <-ticker.C:
 			c.mu.Lock()
-			if c.lastCommited == c.maxReceived.Offset {
-				c.mu.Unlock()
-				continue
-			}
+			toCommit := make([]kafka.TopicPartition, 0)
+			for partID, ps := range c.partitions {
+				if ps.lastCommited == ps.maxReceived {
+					continue
+				}
 
-			safeCommit := *c.maxReceived
-			for offset := c.lastCommited; offset < c.maxReceived.Offset; offset++ {
-				completed, exists := c.msgsStateMap[offset]
-				if !exists {
+				safeOffset := ps.maxReceived
+				for offset := ps.lastCommited; offset < ps.maxReceived; offset++ {
+					completed, exists := ps.msgsStateMap[offset]
+					if !exists {
+						continue
+					}
+					if completed {
+						delete(ps.msgsStateMap, offset)
+						continue
+					}
+					safeOffset = offset
+					break
+				}
+
+				if safeOffset == ps.lastCommited {
 					continue
 				}
-				if completed {
-					delete(c.msgsStateMap, offset)
-					continue
-				}
-				safeCommit.Offset = offset
-				break
+
+				toCommit = append(toCommit, kafka.TopicPartition{
+					Topic:     &c.topic,
+					Partition: partID,
+					Offset:    safeOffset,
+				})
 			}
 			c.mu.Unlock()
 
-			if safeCommit.Offset == c.lastCommited {
+			if len(toCommit) == 0 {
 				continue
 			}
 
-			_, err := c.consumer.CommitOffsets([]kafka.TopicPartition{safeCommit})
+			_, err := c.consumer.CommitOffsets(toCommit)
 			if err != nil {
-				logrus.WithError(err).Errorf("failed to commit offset %d", safeCommit.Offset)
+				logrus.WithError(err).Error("failed to commit offsets")
 				continue
 			}
 
 			c.mu.Lock()
-			c.lastCommited = safeCommit.Offset
+			for _, tp := range toCommit {
+				c.partitions[tp.Partition].lastCommited = tp.Offset
+				logrus.WithFields(logrus.Fields{
+					"partition": tp.Partition,
+					"offset":    tp.Offset,
+				}).Info("committed offset")
+			}
 			c.mu.Unlock()
-			logrus.WithField("offset", safeCommit.Offset).Warn("committed offset")
 
 		case <-c.exitCH:
 			return
@@ -188,7 +270,7 @@ func (c *KafkaConsumer) initializeKafkaTopic(brokers, topicName string) error {
 	logrus.WithField("topic", topicName).Info("creating topic")
 	topicSpec := kafka.TopicSpecification{
 		Topic:             topicName,
-		NumPartitions:     1,
+		NumPartitions:     3,
 		ReplicationFactor: 1,
 	}
 
