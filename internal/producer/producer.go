@@ -36,9 +36,10 @@ func NewKafkaProducer(topic string) (*KafkaProducer, error) {
 	return &KafkaProducer{producer: p, topic: topic}, nil
 }
 
-func (p *KafkaProducer) Produce(msg []byte) {
+func (p *KafkaProducer) Produce(key, msg []byte) {
 	err := p.producer.Produce(&kafka.Message{
 		TopicPartition: kafka.TopicPartition{Topic: &p.topic, Partition: kafka.PartitionAny},
+		Key:            key,
 		Value:          msg,
 	}, nil)
 	if err != nil {
