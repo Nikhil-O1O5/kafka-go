@@ -24,13 +24,15 @@ func NewOrderService(orderRepo *repo.OrderRepo, outboxRepo *repo.OutboxRepo) *Or
 
 func (s *OrderService) Create(ctx context.Context, item string) (string, error) {
 	order := repo.NewOrder(item)
+	outboxEvent := repo.NewOutboxEvent(order.OrderId, "")
 
-	payload, err := json.Marshal(order)
+	// use outbox_id as event_id so the consumer has a stable deduplication key
+	kafkaEvent := repo.NewEventWithId(outboxEvent.OutboxId)
+	payload, err := json.Marshal(kafkaEvent)
 	if err != nil {
-		return "", fmt.Errorf("marshal order: %w", err)
+		return "", fmt.Errorf("marshal kafka event: %w", err)
 	}
-
-	outboxEvent := repo.NewOutboxEvent(order.OrderId, string(payload))
+	outboxEvent.Payload = string(payload)
 
 	_, err = repo.TxClosure(ctx, s.orderRepo.DB(), func(ctx context.Context, tx *sqlx.Tx) (string, error) {
 		if _, err := s.orderRepo.Insert(ctx, tx, order); err != nil {

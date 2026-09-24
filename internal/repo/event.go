@@ -21,6 +21,13 @@ func NewEvent() *Event {
 	}
 }
 
+func NewEventWithId(id string) *Event {
+	return &Event{
+		EventId:   id,
+		CreatedAt: time.Now(),
+	}
+}
+
 type EventRepo struct {
 	db *sqlx.DB
 }
