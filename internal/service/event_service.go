@@ -17,7 +17,7 @@ func NewEventService(eventRepo *repo.EventRepo) *EventService {
 }
 
 func (s *EventService) Process(ctx context.Context, event *repo.Event) error {
-	_, err := repo.TxClosure(ctx, s.eventRepo, func(ctx context.Context, tx *sqlx.Tx) (string, error) {
+	_, err := repo.TxClosure(ctx, s.eventRepo.DB(), func(ctx context.Context, tx *sqlx.Tx) (string, error) {
 		if existing := s.eventRepo.Get(ctx, tx, event.EventId); existing != nil {
 			logrus.WithField("event_id", event.EventId).Info("duplicate event — skipping")
 			return "", nil
