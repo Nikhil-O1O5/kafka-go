@@ -179,6 +179,7 @@ func (c *KafkaConsumer) appendMsgState(tp *kafka.TopicPartition) {
 
 func (c *KafkaConsumer) MarkAsComplete(tp *kafka.TopicPartition) {
 	logrus.WithFields(logrus.Fields{
+		"topic":     c.topic,
 		"partition": tp.Partition,
 		"offset":    tp.Offset,
 	}).Info("MarkAsComplete")
@@ -246,6 +247,7 @@ func (c *KafkaConsumer) commitOffsetLoop() {
 			for _, tp := range toCommit {
 				c.partitions[tp.Partition].lastCommited = tp.Offset
 				logrus.WithFields(logrus.Fields{
+					"topic":     c.topic,
 					"partition": tp.Partition,
 					"offset":    tp.Offset,
 				}).Info("committed offset")

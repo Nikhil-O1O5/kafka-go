@@ -19,6 +19,7 @@ import (
 
 type Server struct {
 	consumer     *consumer.KafkaConsumer
+	cdcConsumer  *consumer.CDCConsumer
 	msgCH        chan *shared.Message
 	eventService *service.EventService
 	outboxSvc    *service.OutboxService
@@ -28,10 +29,16 @@ type Server struct {
 func NewServer(
 	eventService *service.EventService,
 	outboxSvc *service.OutboxService,
+	cdcService *service.CDCService,
 	orderHandler *nethttp.OrderHandler,
 ) (*Server, error) {
 	msgCH := make(chan *shared.Message, 64)
 	c, err := consumer.NewKafkaConsumer(msgCH)
+	if err != nil {
+		return nil, err
+	}
+
+	cdcConsumer, err := consumer.NewCDCConsumer(cdcService.HandleEnvelope)
 	if err != nil {
 		return nil, err
 	}
@@ -41,6 +48,7 @@ func NewServer(
 
 	return &Server{
 		consumer:     c,
+		cdcConsumer:  cdcConsumer,
 		msgCH:        msgCH,
 		eventService: eventService,
 		outboxSvc:    outboxSvc,
@@ -76,6 +84,7 @@ func (s *Server) start() {
 func (s *Server) stop() {
 	s.outboxSvc.Stop()
 	s.consumer.Close()
+	s.cdcConsumer.Close()
 	if err := s.httpServer.Shutdown(context.Background()); err != nil {
 		logrus.WithError(err).Error("http server shutdown error")
 	}
@@ -103,9 +112,10 @@ func main() {
 	eventService := service.NewEventService(eventRepo)
 	orderService := service.NewOrderService(orderRepo, outboxRepo)
 	outboxSvc := service.NewOutboxService(outboxRepo, p)
+	cdcService := service.NewCDCService()
 	orderHandler := nethttp.NewOrderHandler(orderService)
 
-	s, err := NewServer(eventService, outboxSvc, orderHandler)
+	s, err := NewServer(eventService, outboxSvc, cdcService, orderHandler)
 	if err != nil {
 		logrus.WithError(err).Fatal("server init failed")
 	}
