@@ -5,19 +5,37 @@ import (
 	"fmt"
 
 	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const schema = `
+CREATE TABLE IF NOT EXISTS orders (
+	order_id   TEXT PRIMARY KEY,
+	item       TEXT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS outbox (
+	outbox_id  TEXT PRIMARY KEY,
+	order_id   TEXT NOT NULL,
+	payload    TEXT NOT NULL,
+	status     TEXT NOT NULL DEFAULT 'pending',
+	created_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
 	event_id   TEXT PRIMARY KEY,
-	created_at DATETIME NOT NULL
+	created_at TIMESTAMPTZ NOT NULL
 );`
 
 func NewDBConn() (*sqlx.DB, error) {
-	db, err := sqlx.Open("sqlite3", "./events.db")
+	dsn := "host=localhost port=5432 user=kafka_user password=kafka_pass dbname=kafkadb sslmode=disable"
+	db, err := sqlx.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+	if err = db.Ping(); err != nil {
+		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	if _, err = db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)
@@ -25,33 +43,8 @@ func NewDBConn() (*sqlx.DB, error) {
 	return db, nil
 }
 
-type EventRepo struct {
-	db *sqlx.DB
-}
-
-func NewEventRepo(db *sqlx.DB) *EventRepo {
-	return &EventRepo{db: db}
-}
-
-func (r *EventRepo) Get(ctx context.Context, tx *sqlx.Tx, eventId string) *Event {
-	var event Event
-	err := tx.GetContext(ctx, &event, `SELECT event_id, created_at FROM events WHERE event_id = ?`, eventId)
-	if err != nil {
-		return nil
-	}
-	return &event
-}
-
-func (r *EventRepo) Insert(ctx context.Context, tx *sqlx.Tx, event *Event) (string, error) {
-	_, err := tx.ExecContext(ctx, `INSERT INTO events (event_id, created_at) VALUES (?, ?)`, event.EventId, event.CreatedAt)
-	if err != nil {
-		return "", fmt.Errorf("insert event: %w", err)
-	}
-	return event.EventId, nil
-}
-
-func TxClosure[T any](ctx context.Context, r *EventRepo, fn func(context.Context, *sqlx.Tx) (T, error)) (T, error) {
-	tx, err := r.db.BeginTxx(ctx, nil)
+func TxClosure[T any](ctx context.Context, db *sqlx.DB, fn func(context.Context, *sqlx.Tx) (T, error)) (T, error) {
+	tx, err := db.BeginTxx(ctx, nil)
 	if err != nil {
 		var zero T
 		return zero, fmt.Errorf("begin tx: %w", err)

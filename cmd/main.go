@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/Nikhil-O1O5/kafka-go/internal/consumer"
+	"github.com/Nikhil-O1O5/kafka-go/internal/debezium"
+	nethttp "github.com/Nikhil-O1O5/kafka-go/internal/http"
 	"github.com/Nikhil-O1O5/kafka-go/internal/producer"
 	"github.com/Nikhil-O1O5/kafka-go/internal/repo"
 	"github.com/Nikhil-O1O5/kafka-go/internal/service"
@@ -17,49 +18,42 @@ import (
 )
 
 type Server struct {
-	producer     *producer.KafkaProducer
 	consumer     *consumer.KafkaConsumer
+	cdcConsumer  *consumer.CDCConsumer
 	msgCH        chan *shared.Message
 	eventService *service.EventService
-	stopCH       chan struct{}
+	outboxSvc    *service.OutboxService
+	httpServer   *http.Server
 }
 
-func NewServer(eventService *service.EventService) (*Server, error) {
+func NewServer(
+	eventService *service.EventService,
+	outboxSvc *service.OutboxService,
+	cdcService *service.CDCService,
+	orderHandler *nethttp.OrderHandler,
+) (*Server, error) {
 	msgCH := make(chan *shared.Message, 64)
 	c, err := consumer.NewKafkaConsumer(msgCH)
 	if err != nil {
 		return nil, err
 	}
-	p, err := producer.NewKafkaProducer("")
+
+	cdcConsumer, err := consumer.NewCDCConsumer(cdcService.HandleEnvelope)
 	if err != nil {
 		return nil, err
 	}
+
+	mux := http.NewServeMux()
+	orderHandler.RegisterRoutes(mux)
+
 	return &Server{
-		producer:     p,
 		consumer:     c,
+		cdcConsumer:  cdcConsumer,
 		msgCH:        msgCH,
 		eventService: eventService,
-		stopCH:       make(chan struct{}),
+		outboxSvc:    outboxSvc,
+		httpServer:   &http.Server{Addr: ":8080", Handler: mux},
 	}, nil
-}
-
-func (s *Server) produceMsg() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			event := repo.NewEvent()
-			b, err := json.Marshal(event)
-			if err != nil {
-				logrus.WithError(err).Error("marshal failed")
-				continue
-			}
-			s.producer.Produce([]byte(event.EventId), b)
-		case <-s.stopCH:
-			return
-		}
-	}
 }
 
 func (s *Server) handleMsg(msg *shared.Message) {
@@ -70,9 +64,30 @@ func (s *Server) handleMsg(msg *shared.Message) {
 	}
 }
 
+func (s *Server) start() {
+	go func() {
+		logrus.WithField("addr", s.httpServer.Addr).Info("http server started")
+		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logrus.WithError(err).Fatal("http server error")
+		}
+	}()
+
+	go s.outboxSvc.Start()
+
+	go func() {
+		for msg := range s.msgCH {
+			go s.handleMsg(msg)
+		}
+	}()
+}
+
 func (s *Server) stop() {
-	close(s.stopCH)
+	s.outboxSvc.Stop()
 	s.consumer.Close()
+	s.cdcConsumer.Close()
+	if err := s.httpServer.Shutdown(context.Background()); err != nil {
+		logrus.WithError(err).Error("http server shutdown error")
+	}
 }
 
 func main() {
@@ -81,17 +96,31 @@ func main() {
 		logrus.WithError(err).Fatal("db init failed")
 	}
 
-	s, err := NewServer(service.NewEventService(repo.NewEventRepo(db)))
+	if err := debezium.RegisterConnector(); err != nil {
+		logrus.WithError(err).Fatal("debezium connector registration failed")
+	}
+
+	p, err := producer.NewKafkaProducer("")
+	if err != nil {
+		logrus.WithError(err).Fatal("producer init failed")
+	}
+
+	eventRepo := repo.NewEventRepo(db)
+	orderRepo := repo.NewOrderRepo(db)
+	outboxRepo := repo.NewOutboxRepo(db)
+
+	eventService := service.NewEventService(eventRepo)
+	orderService := service.NewOrderService(orderRepo, outboxRepo)
+	outboxSvc := service.NewOutboxService(outboxRepo, p)
+	cdcService := service.NewCDCService()
+	orderHandler := nethttp.NewOrderHandler(orderService)
+
+	s, err := NewServer(eventService, outboxSvc, cdcService, orderHandler)
 	if err != nil {
 		logrus.WithError(err).Fatal("server init failed")
 	}
 
-	go s.produceMsg()
-	go func() {
-		for msg := range s.msgCH {
-			go s.handleMsg(msg)
-		}
-	}()
+	s.start()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
