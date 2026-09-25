@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"github.com/Nikhil-O1O5/kafka-go/internal/consumer"
+	"github.com/Nikhil-O1O5/kafka-go/internal/debezium"
 	nethttp "github.com/Nikhil-O1O5/kafka-go/internal/http"
 	"github.com/Nikhil-O1O5/kafka-go/internal/producer"
 	"github.com/Nikhil-O1O5/kafka-go/internal/repo"
@@ -84,6 +85,10 @@ func main() {
 	db, err := repo.NewDBConn()
 	if err != nil {
 		logrus.WithError(err).Fatal("db init failed")
+	}
+
+	if err := debezium.RegisterConnector(); err != nil {
+		logrus.WithError(err).Fatal("debezium connector registration failed")
 	}
 
 	p, err := producer.NewKafkaProducer("")

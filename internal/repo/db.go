@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS outbox (
 	payload    TEXT NOT NULL,
 	status     TEXT NOT NULL DEFAULT 'pending',
 	created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS events (
+	event_id   TEXT PRIMARY KEY,
+	created_at TIMESTAMPTZ NOT NULL
 );`
 
 func NewDBConn() (*sqlx.DB, error) {

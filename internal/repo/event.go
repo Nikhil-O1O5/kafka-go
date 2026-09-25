@@ -2,6 +2,8 @@ package repo
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -40,7 +42,10 @@ func (r *EventRepo) DB() *sqlx.DB { return r.db }
 
 func (r *EventRepo) Get(ctx context.Context, tx *sqlx.Tx, eventId string) *Event {
 	var event Event
-	err := tx.GetContext(ctx, &event, `SELECT event_id, created_at FROM events WHERE event_id = ?`, eventId)
+	err := tx.GetContext(ctx, &event, `SELECT event_id, created_at FROM events WHERE event_id = $1`, eventId)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return nil
 	}
@@ -48,7 +53,7 @@ func (r *EventRepo) Get(ctx context.Context, tx *sqlx.Tx, eventId string) *Event
 }
 
 func (r *EventRepo) Insert(ctx context.Context, tx *sqlx.Tx, event *Event) (string, error) {
-	_, err := tx.ExecContext(ctx, `INSERT INTO events (event_id, created_at) VALUES (?, ?)`, event.EventId, event.CreatedAt)
+	_, err := tx.ExecContext(ctx, `INSERT INTO events (event_id, created_at) VALUES ($1, $2)`, event.EventId, event.CreatedAt)
 	if err != nil {
 		return "", fmt.Errorf("insert event: %w", err)
 	}
