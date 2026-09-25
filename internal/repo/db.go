@@ -5,19 +5,14 @@ import (
 	"fmt"
 
 	"github.com/jmoiron/sqlx"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const schema = `
-CREATE TABLE IF NOT EXISTS events (
-	event_id   TEXT PRIMARY KEY,
-	created_at DATETIME NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS orders (
 	order_id   TEXT PRIMARY KEY,
 	item       TEXT NOT NULL,
-	created_at DATETIME NOT NULL
+	created_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS outbox (
@@ -25,13 +20,17 @@ CREATE TABLE IF NOT EXISTS outbox (
 	order_id   TEXT NOT NULL,
 	payload    TEXT NOT NULL,
 	status     TEXT NOT NULL DEFAULT 'pending',
-	created_at DATETIME NOT NULL
+	created_at TIMESTAMPTZ NOT NULL
 );`
 
 func NewDBConn() (*sqlx.DB, error) {
-	db, err := sqlx.Open("sqlite3", "./events.db")
+	dsn := "host=localhost port=5432 user=kafka_user password=kafka_pass dbname=kafkadb sslmode=disable"
+	db, err := sqlx.Open("pgx", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
+	}
+	if err = db.Ping(); err != nil {
+		return nil, fmt.Errorf("ping db: %w", err)
 	}
 	if _, err = db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("create schema: %w", err)

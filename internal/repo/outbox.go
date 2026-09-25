@@ -46,7 +46,7 @@ func (r *OutboxRepo) DB() *sqlx.DB { return r.db }
 
 func (r *OutboxRepo) Insert(ctx context.Context, tx *sqlx.Tx, event *OutboxEvent) error {
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO outbox (outbox_id, order_id, payload, status, created_at) VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO outbox (outbox_id, order_id, payload, status, created_at) VALUES ($1, $2, $3, $4, $5)`,
 		event.OutboxId, event.OrderId, event.Payload, event.Status, event.CreatedAt,
 	)
 	if err != nil {
@@ -56,7 +56,10 @@ func (r *OutboxRepo) Insert(ctx context.Context, tx *sqlx.Tx, event *OutboxEvent
 }
 
 func (r *OutboxRepo) GetAllPending(ctx context.Context, tx *sqlx.Tx) ([]*OutboxEvent, error) {
-	rows, err := tx.QueryxContext(ctx, `SELECT outbox_id, order_id, payload, status, created_at FROM outbox WHERE status = ?`, OutboxStatus_Pending)
+	rows, err := tx.QueryxContext(ctx,
+		`SELECT outbox_id, order_id, payload, status, created_at FROM outbox WHERE status = $1`,
+		OutboxStatus_Pending,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("get pending outbox events: %w", err)
 	}
@@ -81,6 +84,8 @@ func (r *OutboxRepo) UpdateStatusByIds(ctx context.Context, tx *sqlx.Tx, ids []s
 	if err != nil {
 		return fmt.Errorf("build update query: %w", err)
 	}
+	// sqlx.In uses ? placeholders — rebind for Postgres
+	query = tx.Rebind(query)
 	_, err = tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("update outbox status: %w", err)

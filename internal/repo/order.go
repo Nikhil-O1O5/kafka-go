@@ -35,7 +35,7 @@ func (r *OrderRepo) DB() *sqlx.DB { return r.db }
 
 func (r *OrderRepo) Insert(ctx context.Context, tx *sqlx.Tx, order *Order) (string, error) {
 	_, err := tx.ExecContext(ctx,
-		`INSERT INTO orders (order_id, item, created_at) VALUES (?, ?, ?)`,
+		`INSERT INTO orders (order_id, item, created_at) VALUES ($1, $2, $3)`,
 		order.OrderId, order.Item, order.CreatedAt,
 	)
 	if err != nil {
